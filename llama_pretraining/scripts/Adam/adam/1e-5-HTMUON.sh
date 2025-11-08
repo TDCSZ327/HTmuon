@@ -1,6 +1,6 @@
 export WANDB_API_KEY='Your_WandB_API_Key_Here'
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-torchrun --nproc_per_node=4 --master_port=20109 --master_addr=localhost torchrun_main_htmuon.py \
+torchrun --nproc_per_node=4 --master_port=20109 --master_addr=localhost torchrun_main_htmuon_v2.py \
     --model_config configs/llama_130m.json \
     --optimizer mlast_norg \
     --seed 5 \
@@ -21,7 +21,7 @@ torchrun --nproc_per_node=4 --master_port=20109 --master_addr=localhost torchrun
 
 export WANDB_API_KEY='Your_WandB_API_Key_Here'
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-torchrun --nproc_per_node=4 --master_port=20109 --master_addr=localhost torchrun_main_htmuon.py \
+torchrun --nproc_per_node=4 --master_port=20109 --master_addr=localhost torchrun_main_htmuon_v2.py \
     --model_config configs/llama_130m.json \
     --optimizer mlast_g \
     --seed 5 \
