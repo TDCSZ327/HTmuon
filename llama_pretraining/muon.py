@@ -52,23 +52,23 @@ def zeropower_via_newtonschulz_exact(G: torch.Tensor,
     """
     assert G.ndim >= 2
 
-    # 用高一点的精度算
+
     X = G.float()
 
-    # 如果是宽矩阵，先转成 tall，再转回去
+ 
     transposed = False
     if X.size(-2) < X.size(-1):
         X = X.mT
         transposed = True
 
-    # 预缩放：保证谱半径 <= 1（Fro 范数是谱范数的上界）
+
     frob = X.norm(dim=(-2, -1), keepdim=True)
     X = X / (frob + eps)
 
     n = X.size(-1)
     I = torch.eye(n, device=X.device, dtype=X.dtype)
 
-    # Newton–Schulz 迭代：收敛到 UV^T
+
     for _ in range(steps):
         XtX = X.mT @ X                    # (..., n, n)
         X = 0.5 * X @ (3.0 * I - XtX)     # (..., m, n)
@@ -76,7 +76,7 @@ def zeropower_via_newtonschulz_exact(G: torch.Tensor,
     if transposed:
         X = X.mT
 
-    # cast 回原来的 dtype（比如 bfloat16）
+
     return X.to(G.dtype)
 
 
@@ -89,76 +89,151 @@ def gram_root_1_16_via_newtonschulz(G, power, ns_steps: int = 5, eps: float = 1e
     """
     assert G.ndim >= 2
 
-    # 工作精度建议至少 fp32，再根据需要 cast 回去
+ 
     G_work = G.float()
 
-    # Gram matrix A = G^T G, shape (..., n, n)
+
     A = G_work.transpose(-2, -1) @ G_work
 
-    # 轻微正则，防止奇异
+
     n = A.size(-1)
     I_base = torch.eye(n, device=A.device, dtype=A.dtype)
-    I = I_base.expand(A.shape)  # broadcast 到 batch 维度
+    I = I_base.expand(A.shape)  
     A = A + eps * I
 
-    S = A  # 当前的 SPD 矩阵，开始是 A，本层结束后会变成 A^(1/2), 再给下一层
-    val = math.log(power, 0.5) + 1   # 理论上就是 4.0
+    S = A   
+    val = math.log(power, 0.5) + 1   
     val = int(round(val)) 
 
-    for _ in range(val):  # 4 次 sqrt -> 1/16 次方
-        # 1) 缩放，保证谱半径适中
-        alpha = S.norm(dim=(-2, -1), keepdim=True)  # Fro 范数
-        alpha = alpha.clamp_min(eps)                # 防止除零
+    for _ in range(val):  
+        
+        alpha = S.norm(dim=(-2, -1), keepdim=True) 
+        alpha = alpha.clamp_min(eps)               
         S_tilde = S / alpha
 
         # 2) Newton–Schulz for matrix square root of S_tilde
         Y = S_tilde.clone()
-        Z = I_base.expand(S_tilde.shape).clone()    # 每层新的 I，避免梯度奇怪广播
+        Z = I_base.expand(S_tilde.shape).clone()    
 
         for _ in range(ns_steps):
             T = 3.0 * I - Z @ Y          # 3I - Z Y
             Y = 0.5 * (Y @ T)            # Y_{k+1}
             Z = 0.5 * (T @ Z)            # Z_{k+1}
 
-        # 3) 还原缩放
-        S = (alpha.sqrt()) * Y          # 现在 S ≈ 原 S 的 1/2 次方
+       
+        S = (alpha.sqrt()) * Y          
 
-        # （可选）再加一次 tiny 正则，保证 SPD
+        
         S = 0.5 * (S + S.transpose(-2, -1))         # symmetrize
         S = S + eps * I
 
-    # 此时 S ≈ (G^T G)^{1/16}
-    # 如需 bfloat16 可以在最后转换
+
     return S.to(G.dtype)
 
+
+import torch
+import math
+
+def ns_matrix_sqrt(S, ns_steps: int = 5, eps: float = 1e-6):
+
+    
+    assert S.ndim >= 2
+    n = S.size(-1)
+    I_base = torch.eye(n, device=S.device, dtype=S.dtype)
+    I = I_base.expand(S.shape)
+
+
+    alpha = S.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    S_tilde = S / alpha
+
+    Y = S_tilde.clone()
+    Z = I_base.expand(S_tilde.shape).clone()
+
+    for _ in range(ns_steps):
+        T = 3.0 * I - Z @ Y
+        Y = 0.5 * (Y @ T)
+        Z = 0.5 * (T @ Z)
+
+    S_sqrt = alpha.sqrt() * Y
+    S_sqrt = 0.5 * (S_sqrt + S_sqrt.transpose(-2, -1)) + eps * I
+    return S_sqrt
+
+
+def ns_matrix_invsqrt(S, ns_steps: int = 5, eps: float = 1e-6):
+    
+    assert S.ndim >= 2
+    n = S.size(-1)
+    I_base = torch.eye(n, device=S.device, dtype=S.dtype)
+    I = I_base.expand(S.shape)
+
+    alpha = S.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    S_tilde = S / alpha
+
+    Y = S_tilde.clone()
+    Z = I_base.expand(S_tilde.shape).clone()
+
+    for _ in range(ns_steps):
+        T = 3.0 * I - Z @ Y
+        Y = 0.5 * (Y @ T)
+        Z = 0.5 * (T @ Z)
+
+    
+    S_invsqrt = alpha.rsqrt() * Z
+    S_invsqrt = 0.5 * (S_invsqrt + S_invsqrt.transpose(-2, -1))
+    
+    return S_invsqrt
+
+def gram_power_minus_7_16_via_newtonschulz(
+    G,
+    ns_steps: int = 5,
+    eps: float = 1e-6,
+):
+    
+    assert G.ndim >= 2
+
+    
+    G_work = G.float()
+
+    
+    A = G_work.transpose(-2, -1) @ G_work
+    n = A.size(-1)
+    I_base = torch.eye(n, device=A.device, dtype=A.dtype)
+    I = I_base.expand(A.shape)
+
+   
+    A = A + eps * I
+
+    
+    S = A
+    for _ in range(3):
+        S = ns_matrix_sqrt(S, ns_steps=ns_steps, eps=eps)
+
+    
+    A_neg_1_16 = ns_matrix_invsqrt(S, ns_steps=ns_steps, eps=eps)
+
+
+    A_neg_7_16 = torch.linalg.matrix_power(A_neg_1_16, 7)
+
+   
+    A_neg_7_16 = 0.5 * (A_neg_7_16 + A_neg_7_16.transpose(-2, -1)) + eps * I
+
+    return A_neg_7_16.to(G.dtype)
 
 
 
 def taylor_sqrt_poly(S, I_base, degree: int = 4, eps: float = 1e-6):
-    """
-    用 sqrt(1 + u) 在 u=0 处的泰勒展开来近似 sqrt(S) 的一层（矩阵）开方。
-    S: (..., n, n) SPD
-    I_base: (n, n) 的单位矩阵（不含 batch 维度）
-    degree: 使用到的泰勒展开阶数（1~4）
-    """
-    # 1) broadcast 单位阵
+
     I = I_base.expand(S.shape)
 
-    # 2) 缩放，尽量把谱压到 ~1 附近，方便在 I 附近展开
-    alpha = S.norm(dim=(-2, -1), keepdim=True)   # Fro 范数
+    
+    alpha = S.norm(dim=(-2, -1), keepdim=True)   
     alpha = alpha.clamp_min(eps)
-    S_tilde = S / alpha                           # 期望特征值在 (0, 1] 这一带
+    S_tilde = S / alpha                           
 
-    # 3) 在 I 附近做泰勒展开：sqrt(S_tilde) ≈ P(S_tilde)
-    #    设 S_tilde = I + X， X = S_tilde - I
-    #    sqrt(1 + u) = 1
-    #                 + (1/2) u
-    #                 - (1/8) u^2
-    #                 + (1/16) u^3
-    #                 - (5/128) u^4 + ...
+
     X = S_tilde - I
 
-    # 常数项 + 一次项
+
     Y = I + 0.5 * X
 
     if degree >= 2:
@@ -173,7 +248,7 @@ def taylor_sqrt_poly(S, I_base, degree: int = 4, eps: float = 1e-6):
         X4 = X3 @ X
         Y = Y - 5.0/128.0 * X4  # -5/128
 
-    # 4) 还原缩放：sqrt(S) ≈ sqrt(alpha) * sqrt(S_tilde)
+    
     S_sqrt = (alpha.sqrt()) * Y
 
     return S_sqrt
@@ -181,45 +256,38 @@ def taylor_sqrt_poly(S, I_base, degree: int = 4, eps: float = 1e-6):
 
 def gram_root_1_16_via_taylor(G, power: float = 0.125, taylor_degree: int = 4,
                               eps: float = 1e-6):
-    """
-    用 4 次“泰勒多项式矩阵开方”近似 (G^T G)^{1/16}。
 
-    G: (..., m, n)
-    return: (..., n, n) 近似 (G^T G)^{1/16} 的 SPD 矩阵
-    """
     assert G.ndim >= 2
 
-    # 建议用 fp32 计算
+    
     G_work = G.float()
 
-    # Gram matrix A = G^T G, (..., n, n)
+    
     A = G_work.transpose(-2, -1) @ G_work
 
-    # 轻微正则防止奇异
+    
     n = A.size(-1)
     I_base = torch.eye(n, device=A.device, dtype=A.dtype)
     I = I_base.expand(A.shape)
     A = A + eps * I
 
-    # 初始 S = A
+    
     S = A
 
-    # 根据 power 来决定需要几次 sqrt，power = (1/2)^k => k = log_{1/2}(power)
-    # 对于 1/16，power = 1/16 => k = 4
-    steps = math.log(power, 0.5) + 1   # 理论上就是 4.0
-    steps = int(round(steps))                      # 保险
+    
+    steps = math.log(power, 0.5) + 1  
+    steps = int(round(steps))                     
 
     for i in range(steps):
-        # 用泰勒多项式做一次矩阵开方：S -> S^{1/2}
+        
         S = taylor_sqrt_poly(S, I_base, degree=taylor_degree, eps=eps)
 
-        # 保持 SPD 性质：对称化 + 微正则
+        
         S = 0.5 * (S + S.transpose(-2, -1))
         S = S + eps * I
-        # 若想看每层结果可以打开这一行：
-        # print(f"Iteration {i+1}: approx A^(1/{2**(i+1)})")
+        
 
-    # 此时 S ≈ (G^T G)^{power}，默认 power=1/16
+    
     return S.to(G.dtype)
 
 
@@ -230,10 +298,10 @@ def gram_root_1_16_via_taylor(G, power: float = 0.125, taylor_degree: int = 4,
 def msign_ht(g: torch.Tensor) -> torch.Tensor:
     orig_dtype = g.dtype
     U32, S32, Vh32 = torch.linalg.svd(g.to(torch.float32), full_matrices=False)
-    k = S32.shape[-1]  # 有效奇异值/秩维
-    # d = [1/sqrt(1), 1/sqrt(2), ..., 1/sqrt(k)]
+    k = S32.shape[-1]  
+    
     d = 1.0 / torch.sqrt(torch.arange(1, k + 1, device=S32.device, dtype=S32.dtype))
-    # 让 d 广播到 U32 的最后一维（列缩放）：(..., m, k) * (..., 1, k)
+    
     d_broadcast = d.view(*([1] * (U32.ndim - 2)), 1, k)
     out32 = (U32 * d_broadcast) @ Vh32
     return out32.to(orig_dtype)
@@ -254,24 +322,30 @@ def msign_generalized_ht_v2(g: torch.Tensor, p: float = 0.25) -> torch.Tensor:
     U32, S32, Vh32 = torch.linalg.svd(g.to(torch.float32), full_matrices=False)
     k = S32.shape[-1]
 
-    # 对 S32 每一维做 p 次方
+    
     Sp32 = S32.pow(p)
 
-    # 把处理后的奇异值当作列缩放因子乘回 U
+    
     Sp32_view = Sp32.view(*([1] * (U32.ndim - 2)), 1, k)
     out32 = (U32 * Sp32_view) @ Vh32
 
     return out32.to(orig_dtype)
 
+def svd_project_uvt(g: torch.Tensor, p: float = 0.25) -> torch.Tensor:
+    orig_dtype = g.dtype
+    U32, S32, Vh32 = torch.linalg.svd(g.to(torch.float32), full_matrices=False)
 
+    out32 = U32 @ Vh32
+
+    return out32.to(orig_dtype)
 
 def msign3_ht(g: torch.Tensor) -> torch.Tensor:
     orig_dtype = g.dtype
     U32, S32, Vh32 = torch.linalg.svd(g.to(torch.float32), full_matrices=False)
-    k = S32.shape[-1]  # 有效奇异值/秩维
+    k = S32.shape[-1]  
     # d = [1/sqrt(1), 1/sqrt(2), ..., 1/sqrt(k)]
     d = 1.0 / torch.arange(1, k + 1, device=S32.device, dtype=S32.dtype)
-    # 让 d 广播到 U32 的最后一维（列缩放）：(..., m, k) * (..., 1, k)
+    
     d_broadcast = d.view(*([1] * (U32.ndim - 2)), 1, k)
     out32 = (U32 * d_broadcast) @ Vh32
     return out32.to(orig_dtype)
@@ -338,6 +412,16 @@ def muon_generalized_ht_update(grad, momentum, power=0.25, beta=0.95, ns_steps=5
     return update
 
 
+def svd_project_uvt_update(grad, momentum, power=0.25, beta=0.95, ns_steps=5, nesterov=True):
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    if update.ndim == 4: # for the case of conv filters
+        update = update.view(len(update), -1)
+    update = svd_project_uvt(update,power)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+
 def muon_generalized_ht_update_v2(grad, momentum, power=0.25, beta=0.95, ns_steps=5, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
@@ -383,12 +467,24 @@ def muon_generalized_ht_update_v2_accv3(grad, momentum, power, beta=0.95, ns_ste
     update = update_1 @ update_2
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
-# ====== Device & Precision ======
 
 
-_DEFAULT_DTYPE = torch.bfloat16  # As requested: use bfloat16 by default
 
-# ====== Basic linear algebra helpers (keep bf16 externally) ======
+def muon_generalized_ht_update_v2_accv4(grad, momentum, power=0.125, beta=0.95, ns_steps=5,ns_steps_2=5, nesterov=True):
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    if update.ndim == 4: # for the case of conv filters
+        update = update.view(len(update), -1)
+    update_2 = gram_power_minus_7_16_via_newtonschulz(update)
+    update = update @ update_2
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+
+
+_DEFAULT_DTYPE = torch.bfloat16  
+
+
 def sym(x: torch.Tensor) -> torch.Tensor:
     """Symmetrize (use transpose, not conjugate)"""
     return (x + x.T) * x.new_tensor(0.5)
@@ -413,7 +509,7 @@ def _maybe_real(x: torch.Tensor, tol: float = 1e-7) -> torch.Tensor:
             x = x.real
     return x
 
-# ====== msign / mcsgn (compute in fp32 internally; keep bf16 externally) ======
+
 def mcsgn(x: torch.Tensor) -> torch.Tensor:
     """
     Matrix sign via eigen-decomposition:
@@ -428,11 +524,11 @@ def mcsgn(x: torch.Tensor) -> torch.Tensor:
     """
     orig_dtype = x.dtype
     x32 = x.to(torch.float32)
-    eigvals, eigvecs = torch.linalg.eig(x32)   # may be complex
-    sgn = torch.sign(eigvals)                  # complex-safe: z/|z|
+    eigvals, eigvecs = torch.linalg.eig(x32)   
+    sgn = torch.sign(eigvals)                 
     D = torch.diag(sgn)
     invV = torch.linalg.inv(eigvecs)
-    out = eigvecs @ D @ invV                   # may be complex
+    out = eigvecs @ D @ invV                  
     out = _maybe_real(out).to(torch.float32)
     return out.to(orig_dtype)
 
@@ -1089,217 +1185,13 @@ def adam_update(grad, buf1, buf2, step, betas, eps):
     return buf1c / (buf2c.sqrt() + eps)
 
 
-class Muon2WithAuxAdam(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
-
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
-
-    You can see an example usage below:
-
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
-
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
-    def __init__(self, param_groups):
-
-        for group in param_groups:
-            assert "use_muon" in group
-            if group["use_muon"]:
-                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
-                # defaults
-                group["lr"] = group.get("lr", 0.02)
-                group["momentum"] = group.get("momentum", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
-            else:
-                # defaults
-                group["lr"] = group.get("lr", 3e-4)
-                group["betas"] = group.get("betas", (0.9, 0.95))
-                group["eps"] = group.get("eps", 1e-10)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
-        super().__init__(param_groups, dict())
-
-    @torch.no_grad()
-    def step(self, closure=None):
-
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            if group["use_muon"]:
-                params = group["params"]
-                params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
-                for base_i in range(len(params))[::dist.get_world_size()]:
-                    if base_i + dist.get_rank() < len(params):
-                        p = params[base_i + dist.get_rank()]
-                        if p.grad is None:
-                            # continue
-                            p.grad = torch.zeros_like(p)  # Force synchronization
-                        state = self.state[p]
-                        if len(state) == 0:
-                            state["momentum_buffer"] = torch.zeros_like(p)
-                        update = muon2_ht_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
-                    dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
-            else:
-                for p in group["params"]:
-                    if p.grad is None:
-                        # continue
-                        p.grad = torch.zeros_like(p)  # Force synchronization
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["exp_avg"] = torch.zeros_like(p)
-                        state["exp_avg_sq"] = torch.zeros_like(p)
-                        state["step"] = 0
-                    state["step"] += 1
-                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
-                                         state["step"], group["betas"], group["eps"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
-
-        return loss
-
-
-class Muon3WithAuxAdam(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
-
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
-
-    You can see an example usage below:
-
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
-
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
-    def __init__(self, param_groups):
-
-        for group in param_groups:
-            assert "use_muon" in group
-            if group["use_muon"]:
-                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
-                # defaults
-                group["lr"] = group.get("lr", 0.02)
-                group["momentum"] = group.get("momentum", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
-            else:
-                # defaults
-                group["lr"] = group.get("lr", 3e-4)
-                group["betas"] = group.get("betas", (0.9, 0.95))
-                group["eps"] = group.get("eps", 1e-10)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
-        super().__init__(param_groups, dict())
-
-    @torch.no_grad()
-    def step(self, closure=None):
-
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            if group["use_muon"]:
-                params = group["params"]
-                params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
-                for base_i in range(len(params))[::dist.get_world_size()]:
-                    if base_i + dist.get_rank() < len(params):
-                        p = params[base_i + dist.get_rank()]
-                        if p.grad is None:
-                            # continue
-                            p.grad = torch.zeros_like(p)  # Force synchronization
-                        state = self.state[p]
-                        if len(state) == 0:
-                            state["momentum_buffer"] = torch.zeros_like(p)
-                        update = muon3_ht_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
-                    dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
-            else:
-                for p in group["params"]:
-                    if p.grad is None:
-                        # continue
-                        p.grad = torch.zeros_like(p)  # Force synchronization
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["exp_avg"] = torch.zeros_like(p)
-                        state["exp_avg_sq"] = torch.zeros_like(p)
-                        state["step"] = 0
-                    state["step"] += 1
-                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
-                                         state["step"], group["betas"], group["eps"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
-
-        return loss
 
 
 
 
-class MuonGWithAuxAdam(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
 
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
+class HTMuonHTWithAuxAdam(torch.optim.Optimizer):
 
-    You can see an example usage below:
-
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
-
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
     def __init__(self, param_groups,power=0.25):
 
         for group in param_groups:
@@ -1365,33 +1257,13 @@ class MuonGWithAuxAdam(torch.optim.Optimizer):
         return loss
 
 
-class MuonGWithAuxAdamV2(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
 
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
 
-    You can see an example usage below:
 
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
 
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
+
+class HTMuonWithAuxAdam(torch.optim.Optimizer):
+
     def __init__(self, param_groups,power=0.25):
 
         for group in param_groups:
@@ -1456,33 +1328,127 @@ class MuonGWithAuxAdamV2(torch.optim.Optimizer):
 
         return loss
 
-class MuonGWithAuxAdamV2ACC(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
 
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
 
-    You can see an example usage below:
+class HTMuonIntervalWithAuxAdam(torch.optim.Optimizer):
 
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
 
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
+    def __init__(self, param_groups, power=0.25, interval=10, start_step=0):
+        if interval <= 0:
+            raise ValueError(f"`interval` must be positive, got {interval}")
+
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
+                # defaults
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
+            else:
+                # defaults
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+
+        super().__init__(param_groups, dict())
+
+        self.power = power
+        self.interval = interval
+        
+        self.step_idx = start_step
+
+    @property
+    def global_step(self):
+        
+        return self.step_idx
+
+    @torch.no_grad()
+    def step(self, closure=None):
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+       
+        self.step_idx += 1
+        use_generalized = (self.step_idx % self.interval == 0)
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                params = group["params"]
+               
+                world_size = dist.get_world_size()
+                pad_len = (world_size - len(params) % world_size) % world_size
+                params_pad = params + [torch.empty_like(params[-1])] * pad_len
+
+                for base_i in range(len(params))[::world_size]:
+                    if base_i + dist.get_rank() < len(params):
+                        p = params[base_i + dist.get_rank()]
+                        if p.grad is None:
+                            # Force synchronization
+                            p.grad = torch.zeros_like(p)
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+
+                        if use_generalized:
+                            
+                            update = muon_generalized_ht_update_v2(
+                                p.grad,
+                                state["momentum_buffer"],
+                                self.power,
+                                beta=group["momentum"],
+                            )
+                        else:
+                            
+                            update = muon_update(
+                                p.grad,
+                                state["momentum_buffer"],
+                                beta=group["momentum"],
+                            )
+
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+                    dist.all_gather(
+                        params_pad[base_i:base_i + world_size],
+                        params_pad[base_i + dist.get_rank()],
+                    )
+            else:
+                
+                for p in group["params"]:
+                    if p.grad is None:
+                        # Force synchronization
+                        p.grad = torch.zeros_like(p)
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = adam_update(
+                        p.grad,
+                        state["exp_avg"],
+                        state["exp_avg_sq"],
+                        state["step"],
+                        group["betas"],
+                        group["eps"],
+                    )
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+
+        return loss
+
+
+
+
+class HTMuonNSWithAuxAdam(torch.optim.Optimizer):
+
     def __init__(self, param_groups,power=0.25):
 
         for group in param_groups:
@@ -1549,34 +1515,12 @@ class MuonGWithAuxAdamV2ACC(torch.optim.Optimizer):
 
 
 
-class MuonGWithAuxAdamV2ACCV2(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
+class HTMuonNSIntervalWithAuxAdam(torch.optim.Optimizer):
 
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
 
-    You can see an example usage below:
-
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
-
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
-    def __init__(self, param_groups,power=0.25):
+    def __init__(self, param_groups, power=0.25, interval=10, start_step=0):
+        if interval <= 0:
+            raise ValueError(f"`interval` must be positive, got {interval}")
 
         for group in param_groups:
             assert "use_muon" in group
@@ -1594,8 +1538,18 @@ class MuonGWithAuxAdamV2ACCV2(torch.optim.Optimizer):
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
                 assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+
         super().__init__(param_groups, dict())
-        self.power=power
+
+        self.power = power
+        self.interval = interval
+       
+        self.step_idx = start_step
+
+    @property
+    def global_step(self):
+        
+        return self.step_idx
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -1605,327 +1559,74 @@ class MuonGWithAuxAdamV2ACCV2(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        
+        self.step_idx += 1
+        use_generalized = (self.step_idx % self.interval == 0)
+
         for group in self.param_groups:
             if group["use_muon"]:
                 params = group["params"]
-                params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
-                for base_i in range(len(params))[::dist.get_world_size()]:
+                
+                world_size = dist.get_world_size()
+                pad_len = (world_size - len(params) % world_size) % world_size
+                params_pad = params + [torch.empty_like(params[-1])] * pad_len
+
+                for base_i in range(len(params))[::world_size]:
                     if base_i + dist.get_rank() < len(params):
                         p = params[base_i + dist.get_rank()]
                         if p.grad is None:
-                            # continue
-                            p.grad = torch.zeros_like(p)  # Force synchronization
+                            # Force synchronization
+                            p.grad = torch.zeros_like(p)
                         state = self.state[p]
                         if len(state) == 0:
                             state["momentum_buffer"] = torch.zeros_like(p)
-                        update = muon_generalized_ht_update_v2_accv2(p.grad, state["momentum_buffer"],self.power, beta=group["momentum"])
+
+                        if use_generalized:
+                            
+                            update =  muon_generalized_ht_update_v2_acc(p.grad, state["momentum_buffer"],self.power, beta=group["momentum"])
+                        else:
+                            
+                            update = muon_update(
+                                p.grad,
+                                state["momentum_buffer"],
+                                beta=group["momentum"],
+                            )
+
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                         p.add_(update.reshape(p.shape), alpha=-group["lr"])
-                    dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
+
+                    dist.all_gather(
+                        params_pad[base_i:base_i + world_size],
+                        params_pad[base_i + dist.get_rank()],
+                    )
             else:
+                
                 for p in group["params"]:
                     if p.grad is None:
-                        # continue
-                        p.grad = torch.zeros_like(p)  # Force synchronization
+                        # Force synchronization
+                        p.grad = torch.zeros_like(p)
                     state = self.state[p]
                     if len(state) == 0:
                         state["exp_avg"] = torch.zeros_like(p)
                         state["exp_avg_sq"] = torch.zeros_like(p)
                         state["step"] = 0
                     state["step"] += 1
-                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
-                                         state["step"], group["betas"], group["eps"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
-
-        return loss
-
-class MuonGWithAuxAdamV2ACCV3(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
-
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
-
-    You can see an example usage below:
-
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
-
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
-    def __init__(self, param_groups,power):
-
-        for group in param_groups:
-            assert "use_muon" in group
-            if group["use_muon"]:
-                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
-                # defaults
-                group["lr"] = group.get("lr", 0.02)
-                group["momentum"] = group.get("momentum", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
-            else:
-                # defaults
-                group["lr"] = group.get("lr", 3e-4)
-                group["betas"] = group.get("betas", (0.9, 0.95))
-                group["eps"] = group.get("eps", 1e-10)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
-        super().__init__(param_groups, dict())
-        self.power=power
-
-    @torch.no_grad()
-    def step(self, closure=None):
-
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            if group["use_muon"]:
-                params = group["params"]
-                params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
-                for base_i in range(len(params))[::dist.get_world_size()]:
-                    if base_i + dist.get_rank() < len(params):
-                        p = params[base_i + dist.get_rank()]
-                        if p.grad is None:
-                            # continue
-                            p.grad = torch.zeros_like(p)  # Force synchronization
-                        state = self.state[p]
-                        if len(state) == 0:
-                            state["momentum_buffer"] = torch.zeros_like(p)
-                        update = muon_generalized_ht_update_v2_accv3(p.grad, state["momentum_buffer"],self.power, beta=group["momentum"])
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
-                    dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
-            else:
-                for p in group["params"]:
-                    if p.grad is None:
-                        # continue
-                        p.grad = torch.zeros_like(p)  # Force synchronization
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["exp_avg"] = torch.zeros_like(p)
-                        state["exp_avg_sq"] = torch.zeros_like(p)
-                        state["step"] = 0
-                    state["step"] += 1
-                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
-                                         state["step"], group["betas"], group["eps"])
+                    update = adam_update(
+                        p.grad,
+                        state["exp_avg"],
+                        state["exp_avg_sq"],
+                        state["step"],
+                        group["betas"],
+                        group["eps"],
+                    )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
 
         return loss
 
 
-class MuonOrthWithAuxAdam(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
-
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
-
-    You can see an example usage below:
-
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
-
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
-    def __init__(self, param_groups):
-
-        for group in param_groups:
-            assert "use_muon" in group
-            if group["use_muon"]:
-                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
-                # defaults
-                group["lr"] = group.get("lr", 0.02)
-                group["momentum"] = group.get("momentum", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
-            else:
-                # defaults
-                group["lr"] = group.get("lr", 3e-4)
-                group["betas"] = group.get("betas", (0.9, 0.95))
-                group["eps"] = group.get("eps", 1e-10)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
-        super().__init__(param_groups, dict())
-
-    @torch.no_grad()
-    def step(self, closure=None):
-
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            if group["use_muon"]:
-                params = group["params"]
-                params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
-                for base_i in range(len(params))[::dist.get_world_size()]:
-                    if base_i + dist.get_rank() < len(params):
-                        p = params[base_i + dist.get_rank()]
-                        if p.grad is None:
-                            # continue
-                            p.grad = torch.zeros_like(p)  # Force synchronization
-                        state = self.state[p]
-                        if len(state) == 0:
-                            state["momentum_buffer"] = torch.zeros_like(p)
-                        if p.shape[0] == p.shape[1]:
-                            update = muon_orth_update(p,p.grad, group["lr"],state["momentum_buffer"], beta=group["momentum"])
-                            p.mul_(update.reshape(p.shape))
-                            p.mul_(1 - group["lr"] * group["weight_decay"])
-                        else:
-                            update =  muon_orth_update(p,p.grad, group["lr"],state["momentum_buffer"], beta=group["momentum"])
-                            p.mul_(1 - group["lr"] * group["weight_decay"])
-                            p.add_(update.reshape(p.shape), alpha=-group["lr"])
-             
-
-                    dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
-            else:
-                for p in group["params"]:
-                    if p.grad is None:
-                        # continue
-                        p.grad = torch.zeros_like(p)  # Force synchronization
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["exp_avg"] = torch.zeros_like(p)
-                        state["exp_avg_sq"] = torch.zeros_like(p)
-                        state["step"] = 0
-                    state["step"] += 1
-                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
-                                         state["step"], group["betas"], group["eps"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
-
-        return loss
 
 
-class MuonHTWithAuxAdam(torch.optim.Optimizer):
-    """
-    Distributed Muon variant that can be used for all parameters in the network, since it runs an
-    internal AdamW for the parameters that are not compatible with Muon. The user must manually
-    specify which parameters shall be optimized with Muon and which with Adam by passing in a
-    list of param_groups with the `use_muon` flag set.
-
-    The point of this class is to allow the user to have a single optimizer in their code, rather
-    than having both a Muon and an Adam which each need to be stepped.
-
-    You can see an example usage below:
-
-    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
-    ```
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
-
-    from muon import MuonWithAuxAdam
-    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
-    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
-    param_groups = [*adam_groups, muon_group]
-    optimizer = MuonWithAuxAdam(param_groups)
-    ```
-    """
-    def __init__(self, param_groups):
-
-        for group in param_groups:
-            assert "use_muon" in group
-            if group["use_muon"]:
-                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
-                # defaults
-                group["lr"] = group.get("lr", 0.02)
-                group["momentum"] = group.get("momentum", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
-            else:
-                # defaults
-                group["lr"] = group.get("lr", 3e-4)
-                group["betas"] = group.get("betas", (0.9, 0.95))
-                group["eps"] = group.get("eps", 1e-10)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
-        super().__init__(param_groups, dict())
-
-    @torch.no_grad()
-    def step(self, closure=None):
-
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            if group["use_muon"]:
-                params = group["params"]
-                params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
-                for base_i in range(len(params))[::dist.get_world_size()]:
-                    if base_i + dist.get_rank() < len(params):
-                        p = params[base_i + dist.get_rank()]
-                        if p.grad is None:
-                            # continue
-                            p.grad = torch.zeros_like(p)  # Force synchronization
-                        state = self.state[p]
-                        if len(state) == 0:
-                            state["momentum_buffer"] = torch.zeros_like(p)
-                        if p.shape[0] == p.shape[1]:
-                            update = muon_ht_update(p,p.grad, group["lr"],state["momentum_buffer"], beta=group["momentum"])
-                            p.mul_(update.reshape(p.shape))
-                            p.mul_(1 - group["lr"] * group["weight_decay"])
-                        else:
-                            update =  muon_ht_update(p,p.grad, group["lr"],state["momentum_buffer"], beta=group["momentum"])
-                            p.mul_(1 - group["lr"] * group["weight_decay"])
-                            p.add_(update.reshape(p.shape), alpha=-group["lr"])
-             
-
-                    dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
-            else:
-                for p in group["params"]:
-                    if p.grad is None:
-                        # continue
-                        p.grad = torch.zeros_like(p)  # Force synchronization
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["exp_avg"] = torch.zeros_like(p)
-                        state["exp_avg_sq"] = torch.zeros_like(p)
-                        state["step"] = 0
-                    state["step"] += 1
-                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
-                                         state["step"], group["betas"], group["eps"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
-
-        return loss
 
 
         

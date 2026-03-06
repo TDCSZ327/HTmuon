@@ -11,14 +11,16 @@ import torch.utils.data
 import torch.distributed as dist
 from soap import SOAP
 from mars import MARS
-from Noptimizer import RNNPOptimizer
+
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from transformers import LlamaForCausalLM as HF_LlamaForCausalLM
-
+from COSMOS import COSMOS_for_llama
 import datasets
 import datasets.distributed
 import wandb
+from sophia import SophiaG
+
 
 from tqdm import tqdm
 from loguru import logger
@@ -26,13 +28,13 @@ from loguru import logger
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM
-from WeightDecayUnbalance import modulewise_AlphaDecay
-from muon import MuonWithAuxAdam,Muon2WithAuxAdam,Muon3WithAuxAdam, MuonOrthWithAuxAdam, MuonHTWithAuxAdam,MuonGWithAuxAdam,RNNP, MuonGWithAuxAdamV2,MuonGWithAuxAdamV2ACC,MuonGWithAuxAdamV2ACCV2,MuonGWithAuxAdamV2ACCV3
-from AWD_nips2023 import AdaptiveWeightDecay
+
+from muon import MuonWithAuxAdam,HTMuonHTWithAuxAdam, HTMuonWithAuxAdam,HTMuonNSWithAuxAdam,HTMuonIntervalWithAuxAdam,HTMuonNSIntervalWithAuxAdam
+
 from AdEMAMix import AdEMAMix
 from c_adamw import AdamW as C_AdamW
 from lion_pytorch import Lion
-from normuon import NorMuonWithAuxAdam,NorMuonGWithAuxAdam,NorMuonWithAuxAdamRMS,NorMuonGWithAuxAdamRMS,NorMuonGWithAuxAdamV2,NorMuonGWithAuxAdamV2ACC,NorMuonGWithAuxAdamV2ACCV2,NorMuonGWithAuxAdamV2ACCV3
+from normuon import NorMuonWithAuxAdam,HTNorMuonHTWithAuxAdam,HTNorMuonWithAuxAdam,HTNorMuonNSWithAuxAdam,HTNorMuonIntervalWithAuxAdam,HTNorMuonNSIntervalWithAuxAdam
 from opt_config import configure_optimizers as opt_configure_optimizers
 
 transformers.logging.set_verbosity_error()
@@ -105,24 +107,14 @@ def parse_args(args):
     parser.add_argument("--continue_from", type=str, default=None) 
     parser.add_argument("--optimizer", type=str, default="adam") 
 
-    parser.add_argument("--use_modulewise_wd", action="store_true", help="Whether to use unbalanced weight decay")
+    
 
-    parser.add_argument('--assign_func',         type=str,        default='tb_linear_map',       help='assignment function for layerwise lr')
-    parser.add_argument('--wd_min_ratio',        type=float,    default=0.666)
-    parser.add_argument('--wd_max_ratio',        type=float,    default=3)
-
-    parser.add_argument("--unbalancedWD_every", type=int, default=500, help="Update unbalanced weight decay every n steps")
-    parser.add_argument('--pl_fitting',     type=str,        default='median', choices=['median', 'goodness-of-fit', 'fix-finger'])
-    parser.add_argument('--remove_last_layer',  default=True,   type=lambda x: (str(x).lower() == 'true'),  help='if remove the last layer')
-    parser.add_argument('--remove_first_layer', default=True,   type=lambda x: (str(x).lower() == 'true'),  help='if remove the first layer')
     parser.add_argument('--batchnorm',          default=True,   type=lambda x: (str(x).lower() == 'true'),  help='balancing batch norm layer')
     parser.add_argument('--filter_zeros',       default=False,  type=lambda x: (str(x).lower() == 'true')   )
-    parser.add_argument('--esd_metric_for_tb',   type=str,      default='alpha',  help='ww metric')
-    parser.add_argument('--xmin_pos',            type=float,    default=2, help='xmin_index = size of eigs // xmin_pos')
     parser.add_argument('--batchnorm_type',      type=str,      default='name',  help='method to change batchnorm layer learning rate')
 
-    # baseline1: AWD NeurIPS 2023
-    parser.add_argument("--use_AWD_NeurIPS2023", action="store_true", help="Whether to test AWD from NeurIPS2023")
+
+    
     parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--gradient_accumulation", type=int, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
@@ -227,8 +219,7 @@ def main(args):
     assert args.gradient_accumulation * args.batch_size * world_size == args.total_batch_size, \
         "gradient_accumulation * batch_size * world_size must be equal to total_batch_size"
 
-    if args.use_AWD_NeurIPS2023:
-        args.weight_decay *= 100
+
     
     # turn off logger
     if global_rank != 0: logger.remove()
@@ -335,60 +326,39 @@ def main(args):
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
     logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
     
-    if args.use_modulewise_wd:
-        print("##############Enable and init AlphaDecay Balancing##################")
-        wd_scheduler = modulewise_AlphaDecay(net=model, 
-                    use_modulewise_wd=args.use_modulewise_wd,
-                    pl_fitting=args.pl_fitting,
-                    xmin_pos=args.xmin_pos, 
-                    filter_zeros=args.filter_zeros,
-                    remove_first_layer=args.remove_first_layer,
-                    remove_last_layer=args.remove_last_layer,
-                    esd_metric_for_tb=args.esd_metric_for_tb,
-                    assign_func=args.assign_func,
-                    wd_min_ratio=args.wd_min_ratio,
-                    wd_max_ratio=args.wd_max_ratio,
-                    batchnorm=args.batchnorm,
-                    batchnorm_type=args.batchnorm_type,
-                    wandb_name=args.wandb_name)
-        trainable_params, _, _ = wd_scheduler.build_optimizer_param_group(untuned_wd=args.weight_decay, initialize=True)
-    elif args.use_AWD_NeurIPS2023:
-        print("##############Enable and init AWD NIPS 2023##################")
-        wd_scheduler = AdaptiveWeightDecay(lambda_awd=args.weight_decay)
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-    elif ("muon" in args.optimizer.lower()) or ("rnnp" in args.optimizer.lower()) :
-        body_modules = nn.ModuleDict({
-            "layers": model.model.layers,
-            "norm": model.model.norm,
-        })
-        head_module = model.lm_head
-        embed_module = model.model.embed_tokens
+    # if ("muon" in args.optimizer.lower()) or ("rnnp" in args.optimizer.lower()) :
+    #     body_modules = nn.ModuleDict({
+    #         "layers": model.model.layers,
+    #         "norm": model.model.norm,
+    #     })
+    #     head_module = model.lm_head
+    #     embed_module = model.model.embed_tokens
 
-        tied = (
-            hasattr(model, "lm_head") and
-            hasattr(model.model, "embed_tokens") and
-            getattr(model.lm_head, "weight", None) is getattr(model.model.embed_tokens, "weight", None)
-        )
+    #     tied = (
+    #         hasattr(model, "lm_head") and
+    #         hasattr(model.model, "embed_tokens") and
+    #         getattr(model.lm_head, "weight", None) is getattr(model.model.embed_tokens, "weight", None)
+    #     )
 
-        hidden_weights = []
-        for name, p in body_modules.named_parameters():
-            if p.ndim >= 2 and ("embed_tokens" not in name) and ("lm_head" not in name) and ("lora_" not in name):
-                hidden_weights.append(p)
+    #     hidden_weights = []
+    #     for name, p in body_modules.named_parameters():
+    #         if p.ndim >= 2 and ("embed_tokens" not in name) and ("lm_head" not in name) and ("lora_" not in name):
+    #             hidden_weights.append(p)
 
-        hidden_gains_biases = [p for _, p in body_modules.named_parameters() if p.ndim < 2]
+    #     hidden_gains_biases = [p for _, p in body_modules.named_parameters() if p.ndim < 2]
 
-        if tied:
-            nonhidden_params = list(embed_module.parameters())
-        else:
-            nonhidden_params = [*head_module.parameters(), *embed_module.parameters()]
+    #     if tied:
+    #         nonhidden_params = list(embed_module.parameters())
+    #     else:
+    #         nonhidden_params = [*head_module.parameters(), *embed_module.parameters()]
 
-        trainable_params = [
-            dict(params=hidden_weights, use_muon=True,  lr=args.lrmuon, weight_decay=args.weight_decay),
-            dict(params=hidden_gains_biases + nonhidden_params,
-                use_muon=False, lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay),
-        ]
+    #     trainable_params = [
+    #         dict(params=hidden_weights, use_muon=True,  lr=args.lrmuon, weight_decay=args.weight_decay),
+    #         dict(params=hidden_gains_biases + nonhidden_params,
+    #             use_muon=False, lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay),
+    #     ]
 
-    elif 'mlast' in args.optimizer.lower():
+    if 'muon' in args.optimizer.lower():
         body_modules = nn.ModuleDict({
             "layers": model.model.layers,
             "norm": model.model.norm,
@@ -455,9 +425,7 @@ def main(args):
     else:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-    # ============================================================
-    #  这里开始：增加 AdaMuon 情况，其他 optimizer 保持原样
-    # ============================================================
+
     opt_adamw = None
     opt_adamuon = None
     scheduler_adamuon = None
@@ -468,18 +436,6 @@ def main(args):
         optimizer = configure_optimizers(trainable_params, args.weight_decay, args.lr, 'cuda' if 'cuda' in device else 'cpu', args.use_modulewise_wd)
     elif  args.optimizer.lower() == "muon":   
         optimizer = MuonWithAuxAdam(trainable_params)
-    elif  args.optimizer.lower() == "muon_orth":   
-        optimizer = MuonOrthWithAuxAdam(trainable_params)
-    elif  args.optimizer.lower() == "muon_ht":   
-        optimizer = MuonHTWithAuxAdam(trainable_params)
-    elif  args.optimizer.lower() == "muon_2":   
-        optimizer = Muon2WithAuxAdam(trainable_params)
-    elif  args.optimizer.lower() == "muon_3":   
-        optimizer = Muon3WithAuxAdam(trainable_params)
-    elif  args.optimizer.lower() == "muon_generalized":   
-        optimizer = MuonGWithAuxAdam(trainable_params,args.power)
-    elif  args.optimizer.lower() == "rnnp":   
-        optimizer = RNNP(trainable_params)
     elif args.optimizer.lower() == "soap":
         optimizer = SOAP(trainable_params, lr = args.lr, betas=(.95, .95), weight_decay=args.weight_decay, precondition_frequency=10)
     elif args.optimizer.lower() == "mars":
@@ -490,67 +446,41 @@ def main(args):
         optimizer = C_AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     elif args.optimizer.lower() == "lion":
         optimizer = Lion(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer.lower() == "dsy":
-        optimizer = RNNPOptimizer(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer.lower() == "cosmos":  
+        optimizer = COSMOS_for_llama(trainable_params,lr = args.lr, betas=(0.9, 0.95, 0.95), lr_ratio=0.25)
     elif args.optimizer.lower() == "normuon":
         optimizer = NorMuonWithAuxAdam(trainable_params)
-    elif args.optimizer.lower() == "normlast":
-        optimizer = NorMuonWithAuxAdam(trainable_params)
-    elif args.optimizer.lower() == "mlast_g":
-        optimizer = MuonGWithAuxAdam(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_norg":
-        optimizer = NorMuonGWithAuxAdam(trainable_params,args.power)
-    elif args.optimizer.lower() == "normuon_generalized":
-        optimizer = NorMuonGWithAuxAdam(trainable_params,args.power)
-    elif args.optimizer.lower() == "normuonrms":
-        optimizer = NorMuonWithAuxAdamRMS(trainable_params)
-    elif args.optimizer.lower() == "normlastrms":
-        optimizer = NorMuonWithAuxAdamRMS(trainable_params)
-    elif args.optimizer.lower() == "mlast_norgrms":
-        optimizer = NorMuonGWithAuxAdamRMS(trainable_params,args.power)
-    elif args.optimizer.lower() == "normuon_generalizedrms":
-        optimizer = NorMuonGWithAuxAdamRMS(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_gv2":
-        optimizer = MuonGWithAuxAdamV2(trainable_params,args.power)
-    elif args.optimizer.lower() == "muon_generalizedv2":
-        optimizer = MuonGWithAuxAdamV2(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_norgv2":
-        optimizer = NorMuonGWithAuxAdamV2(trainable_params,args.power)
-    elif args.optimizer.lower() == "normuon_generalizedv2":
-        optimizer = NorMuonGWithAuxAdamV2(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_gv2_acc":
-        optimizer = MuonGWithAuxAdamV2ACC(trainable_params,args.power)
-    elif args.optimizer.lower() == "muon_generalizedv2_acc":
-        optimizer = MuonGWithAuxAdamV2ACC(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_norgv2_acc":
-        optimizer = NorMuonGWithAuxAdamV2ACC(trainable_params,args.power)
-    elif args.optimizer.lower() == "normuon_generalizedv2_acc":
-        optimizer = NorMuonGWithAuxAdamV2ACC(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_gv2_accv2":
-        optimizer = MuonGWithAuxAdamV2ACCV2(trainable_params,args.power)
-    elif args.optimizer.lower() == "muon_generalizedv2_accv2":
-        optimizer = MuonGWithAuxAdamV2ACCV2(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_norgv2_accv2":
-        optimizer = NorMuonGWithAuxAdamV2ACCV2(trainable_params,args.power)
-    elif args.optimizer.lower() == "normuon_generalizedv2_accv2":
-        optimizer = NorMuonGWithAuxAdamV2ACCV2(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_gv2_accv3":
-        optimizer = MuonGWithAuxAdamV2ACCV3(trainable_params,args.power)
-    elif args.optimizer.lower() == "muon_generalizedv2_accv3":
-        optimizer = MuonGWithAuxAdamV2ACCV3(trainable_params,args.power)
-    elif args.optimizer.lower() == "mlast_norgv2_accv3":
-        optimizer = NorMuonGWithAuxAdamV2ACCV3(trainable_params,args.power)
-    elif args.optimizer.lower() == "normuon_generalizedv2_accv3":
-        optimizer = NorMuonGWithAuxAdamV2ACCV3(trainable_params,args.power)
+    elif args.optimizer.lower() == "htmuon_ht":
+        optimizer = HTMuonHTWithAuxAdam(trainable_params,args.power)
+    elif args.optimizer.lower() == "htmuon_normuon_ht":
+        optimizer = HTNorMuonHTWithAuxAdam(trainable_params,args.power)
+    elif args.optimizer.lower() == "htmuon":
+        optimizer = HTMuonWithAuxAdam(trainable_params,args.power)
+    elif args.optimizer.lower() == "htmuon_normuon":
+        optimizer = HTNorMuonWithAuxAdam(trainable_params,args.power)
+    elif args.optimizer.lower() == "htmuon_interval":
+        optimizer = HTMuonIntervalWithAuxAdam(trainable_params,args.power,args.interval)
+    elif args.optimizer.lower() == "htmuon_normuon_interval":
+        optimizer = HTNorMuonIntervalWithAuxAdam(trainable_params,args.power,args.interval) 
+    elif args.optimizer.lower() == "htmuon_ns":
+        optimizer = HTMuonNSWithAuxAdam(trainable_params,args.power)
+    elif args.optimizer.lower() == "htmuon_ns_interval":
+        optimizer = HTMuonNSIntervalWithAuxAdam(trainable_params,args.power,args.interval)
+    elif args.optimizer.lower() == "htmuon_normuon_ns":
+        optimizer = HTNorMuonNSWithAuxAdam(trainable_params,args.power)
+    elif args.optimizer.lower() == "htmuon_normuon_ns_interval":
+        optimizer = HTNorMuonNSIntervalWithAuxAdam(trainable_params,args.power,args.interval)
+    elif args.optimizer.lower() == "sophia":
+        optimizer = SophiaG(trainable_params, lr=args.lr, betas=(0.965, 0.99), rho=0.01, weight_decay=args.weight_decay)
     elif args.optimizer.lower() == "a_d_a_m_u_o_n":
-        # 这里返回两个 optimizer：AdamW + AdaMuon
+        
         opt_adamw, opt_adamuon = opt_configure_optimizers(
             model.named_parameters(),
             weight_decay=args.weight_decay,
             learning_rate=args.lr,
             lrmuon=args.lrmuon
         )
-        optimizer = opt_adamw   # 为了后面大部分代码仍然用到 optimizer（例如 wd_scheduler、lr 读取）
+        optimizer = opt_adamw   
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
@@ -558,8 +488,7 @@ def main(args):
     print(optimizer)
     print('*********************************')
 
-    # ================= Scheduler 部分 =====================
-    # 其他 optimizer 完全保持原逻辑；a_d_a_m_u_o_n 单独给 AdamW 和 AdaMuon
+    
     if args.optimizer.lower() == "a_d_a_m_u_o_n":
         scheduler = training_utils.get_scheculer(
             optimizer=opt_adamw,
@@ -625,13 +554,7 @@ def main(args):
         if global_rank == 0: pbar.update(1) 
 
         wd = args.weight_decay                        
-        if args.use_AWD_NeurIPS2023:
-            wd = wd_scheduler.step(optimizer)
-        elif args.use_modulewise_wd and (update_step+1) % args.unbalancedWD_every == 0:
-            gradnorm = calculate_layer_gradnorms(model.module if hasattr(model, 'module') else model)
-            print('----> One step of AlphaDecay Balancing')
-            layermean_alpha = wd_scheduler.step(optimizer, wd, update_step, rank0=global_rank==0, gradnorm=gradnorm)
-
+        
         # ================== step & scheduler ==================
         if args.optimizer.lower() == "a_d_a_m_u_o_n":
             opt_adamw.step()
@@ -657,7 +580,7 @@ def main(args):
             model.module.generation_config.pad_token_id=0
             model.module.save_pretrained(current_model_directory, max_shard_size='100GB', safe_serialization=False)
 
-            # ====== 保存 checkpoint：AdaMuon 多保存几份，其它不变 ======
+            
             if args.optimizer.lower() == "a_d_a_m_u_o_n":
                 optimizer_checkpoint = {
                     "optimizer_adamw": opt_adamw.state_dict(),
