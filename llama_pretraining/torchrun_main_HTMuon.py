@@ -92,6 +92,7 @@ def parse_args(args):
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--lrmuon", type=float, default=0.02)
     parser.add_argument("--power", type=float, default=0.25)
+    parser.add_argument("--interval", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--total_batch_size", type=int, default=64)
     parser.add_argument("--num_training_steps", type=int, default=20000,
