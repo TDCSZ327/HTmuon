@@ -9,7 +9,7 @@ from torch.optim import Optimizer
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    # 始终在 bfloat16 中做这个迭代（保持你原来的设计）
+    
     X = G.bfloat16()
     X /= (X.norm() + eps)  # ensure top singular value <= 1
     if G.size(0) > G.size(1):
@@ -56,17 +56,17 @@ def soap_with_muon_gpt(
 
         bias_correction1 = 1 - beta1 ** step
         bias_correction2 = 1 - beta2 ** step
-        bias_correction3 = 1 - beta3 ** step  # 预留，保持不变
+        bias_correction3 = 1 - beta3 ** step 
 
-        # 标准一阶动量
+        
         exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
 
         if len(param.size()) == 2 and param.size(0) <= 10000:
-            # 低秩 GNG 逻辑
+            
             param_dtype = param.dtype
 
             if step == 1:
-                # 用 float32 做 SVD，避免 bf16 不支持
+                
                 G32 = grad.to(torch.float32)               # [m, n]
                 W32 = torch.matmul(G32, G32.T)             # [m, m]
                 U32, _, _ = torch.linalg.svd(W32, full_matrices=False)
@@ -74,7 +74,7 @@ def soap_with_muon_gpt(
                 rank = exp_avg_gg.size(0)
                 P32 = U32[:, :rank]                        # [m, rank] float32
 
-                # 写回 P（保持 state 的 dtype，比如 bfloat16）
+                
                 exp_avg_p.copy_(P32.to(param_dtype))
 
                 # 初始化 GG，仍然在 float32 里算，再 cast 回去
@@ -101,11 +101,11 @@ def soap_with_muon_gpt(
                             torch.matmul(G32.T, P32)
                         )
 
-                # 写回 state，保持 dtype 一致
+                
                 exp_avg_p.copy_(P32.to(param_dtype))
                 exp_avg_gg.copy_(GG32.to(param_dtype))
 
-            # 下面保持你原来的逻辑，只是保证 dtype 一致
+            
             scale = (grad.size(0) * grad.size(1)) ** 0.5
             low_rank_grad = torch.matmul(exp_avg_p.T, grad)
             exp_avg_sq.mul_(beta2).addcmul_(low_rank_grad, low_rank_grad.conj(), value=1 - beta2)
@@ -115,7 +115,7 @@ def soap_with_muon_gpt(
             denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
             t1 = step_size * torch.matmul(exp_avg_p, t / denom)
 
-            # 正交补方向 + zeropower
+            
             t = exp_avg - torch.matmul(exp_avg_p, t)
             if t.size(1) == 3 * t.size(0):
                 t = torch.cat(
@@ -130,7 +130,7 @@ def soap_with_muon_gpt(
             param.add_(t1 / (t1.norm() + eps), alpha=-scale * ratio * lr)
 
         else:
-            # 普通 AdamW 分支保持不变
+            
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
             if amsgrad:
                 # Maintains the maximum of all 2nd moment running avg. till now
@@ -317,16 +317,16 @@ def soap_with_muon_llama(
 
         bias_correction1 = 1 - beta1 ** step
         bias_correction2 = 1 - beta2 ** step
-        bias_correction3 = 1 - beta3 ** step  # 预留
+        bias_correction3 = 1 - beta3 ** step  
 
         if len(param.size()) == 2 and param.size(0) <= 10000:
             param_dtype = param.dtype
 
-            # 一阶动量先更新
+            
             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
 
             if step == 1:
-                # 用 float32 做 SVD，避免 bf16 不支持
+                
                 G32 = grad.to(torch.float32)         # [m, n]
                 W32 = torch.matmul(G32.T, G32)       # [n, n]
                 U32, _, _ = torch.linalg.svd(W32, full_matrices=False)
@@ -334,10 +334,10 @@ def soap_with_muon_llama(
                 rank = exp_avg_gg.size(0)
                 P32 = U32[:, :rank]                 # [n, rank]
 
-                # 写回 P（state），注意 llama 里 P 是 (p.size(1), rank)
+                
                 exp_avg_p.copy_(P32.to(param_dtype))
 
-                # 用 float32 计算 GG = (P^T G^T)(G P) * (1 - beta3)
+                
                 GG32 = torch.matmul(
                     torch.matmul(P32.T, G32.T),
                     torch.matmul(G32, P32),
@@ -345,7 +345,7 @@ def soap_with_muon_llama(
                 exp_avg_gg.copy_(GG32.to(param_dtype))
 
             else:
-                # 后续迭代，全程 float32 做，再写回
+                
                 P32 = exp_avg_p.to(torch.float32)    # [n, r]
                 GG32 = exp_avg_gg.to(torch.float32)  # [r, r]
                 G32 = grad.to(torch.float32)         # [m, n]
@@ -384,7 +384,7 @@ def soap_with_muon_llama(
             param.add_(t1 / (t1.norm() + eps), alpha=-scale * ratio * lr)
 
         else:
-            # 非 2D / 大矩阵，普通 AdamW 分支
+            
             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
 
