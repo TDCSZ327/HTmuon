@@ -103,7 +103,7 @@ torchrun --nproc_per_node=4 --master_port=20119 --master_addr=localhost torchrun
     --lrmuon 5e-3\
     --power 0.125 \
     --interval 5 \
-    --batch_size 128 \
+    --batch_size 64 \
     --total_batch_size 512 \
     --num_training_steps 90000 \
     --warmup_steps 9000 \
