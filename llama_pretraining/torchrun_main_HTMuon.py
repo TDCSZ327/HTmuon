@@ -29,7 +29,7 @@ from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM
 
-from muon import MuonWithAuxAdam,HTMuonHTWithAuxAdam, HTMuonWithAuxAdam,HTMuonNSWithAuxAdam,HTMuonIntervalWithAuxAdam,HTMuonNSIntervalWithAuxAdam
+from muon import MuonWithAuxAdam,HTMuonHTWithAuxAdam, HTMuonWithAuxAdam,HTMuonNSWithAuxAdam,HTMuonIntervalWithAuxAdam,HTMuonNSIntervalWithAuxAdam,HTMuonWithAuxAdam_Stream
 
 from AdEMAMix import AdEMAMix
 from c_adamw import AdamW as C_AdamW
@@ -457,6 +457,8 @@ def main(args):
         optimizer = HTNorMuonHTWithAuxAdam(trainable_params,args.power)
     elif args.optimizer.lower() == "htmuon":
         optimizer = HTMuonWithAuxAdam(trainable_params,args.power)
+    elif args.optimizer.lower() == "htmuon_stream":
+        optimizer = HTMuonWithAuxAdam_Stream(trainable_params,args.power)
     elif args.optimizer.lower() == "htmuon_normuon":
         optimizer = HTNorMuonWithAuxAdam(trainable_params,args.power)
     elif args.optimizer.lower() == "htmuon_interval":

@@ -1330,6 +1330,281 @@ class HTMuonWithAuxAdam(torch.optim.Optimizer):
 
 
 
+
+def _dist_is_ready():
+    return dist.is_available() and dist.is_initialized()
+
+
+def _get_world_size():
+    return dist.get_world_size() if _dist_is_ready() else 1
+
+
+def _get_rank():
+    return dist.get_rank() if _dist_is_ready() else 0
+
+
+
+
+
+def _init_v_matrix(M, rank=None):
+    """
+    M: [m, n]
+    Return V0 of shape [n, k].
+    Screenshot says V0 = I.
+    For rectangular matrices, we use the first k columns of I_n.
+    """
+    m, n = M.shape
+    k = min(m, n) if rank is None else min(rank, m, n)
+    V0 = torch.eye(n, device=M.device, dtype=torch.float32)[:, :k]
+    return V0
+
+
+def _col_l2_normalize(X, eps=1e-8):
+    """
+    Normalize each column of X by its L2 norm.
+
+    Args:
+        X: [m, k]
+
+    Returns:
+        U: [m, k], each column unit norm (or zero if tiny)
+        col_norms: [k]
+    """
+    col_norms = torch.linalg.vector_norm(X, ord=2, dim=0)
+    U = X / col_norms.clamp_min(eps).unsqueeze(0)
+
+    small = col_norms <= eps
+    if small.any():
+        U[:, small] = 0.0
+
+    return U, col_norms
+
+
+def msign_generalized_ht_v2_stream_qr(
+    g: torch.Tensor,
+    V_prev: torch.Tensor = None,
+    p: float = 0.25,
+    rank: int = None,
+    eps: float = 1e-8,
+):
+    """
+    Approximate U Sigma^p V^T using across-training-step QR iteration.
+
+    Given current matrix M_t = g, do:
+        V_t = QR(M_t^T M_t V_{t-1})
+        U_t = ColNorm(M_t V_t)
+        Sigma_t = diag(U_t^T M_t V_t)
+
+    Then return:
+        U_t * Sigma_t^p * V_t^T
+
+    Args:
+        g: [m, n]
+        V_prev: [n, k], previous V
+        p: power on singular values
+        rank: k. If None, use full rank min(m, n)
+        eps: numerical stability
+
+    Returns:
+        out: [m, n]
+        V_t: [n, k]
+    """
+    orig_dtype = g.dtype
+    G = g.to(torch.float32)
+    m, n = G.shape
+    k = min(m, n) if rank is None else min(rank, m, n)
+
+    if (
+        V_prev is None
+        or V_prev.shape != (n, k)
+        or V_prev.device != G.device
+        or V_prev.dtype != torch.float32
+    ):
+        V_prev = _init_v_matrix(G, rank=k)
+
+    # V_t = QR(M_t^T M_t V_{t-1})
+    Y = G.T @ (G @ V_prev)  # [n, k]
+    V_t, _ = torch.linalg.qr(Y, mode="reduced")  # [n, k]
+
+    # U_t = ColNorm(M_t V_t)
+    GV = G @ V_t  # [m, k]
+    U_t, _ = _col_l2_normalize(GV, eps=eps)
+
+    # Sigma_t = diag(U_t^T M_t V_t) = diag(U_t^T GV)
+    sigma_t = torch.sum(U_t * GV, dim=0)  # [k]
+    sigma_t = sigma_t.clamp_min(0.0)
+
+    sigma_p = torch.where(
+        sigma_t > eps,
+        sigma_t.pow(p),
+        torch.zeros_like(sigma_t),
+    )
+
+    out = (U_t * sigma_p.unsqueeze(0)) @ V_t.T
+    return out.to(orig_dtype), V_t
+
+
+def muon_generalized_ht_update_v2_stream(
+    grad,
+    momentum,
+    V_prev,
+    power=0.25,
+    beta=0.95,
+    nesterov=True,
+    rank=None,
+    eps=1e-8,
+):
+    """
+    Momentum update + QR-iteration-based spectral transform.
+
+    We treat
+        M_t = lerp(grad, momentum, beta)   if nesterov
+              momentum                     otherwise
+
+    Then approximate U Sigma^p V^T from M_t via the streaming QR iteration.
+    """
+    momentum.lerp_(grad, 1 - beta)
+
+    M_t = torch.lerp(grad, momentum, beta) if nesterov else momentum
+
+    original_shape = M_t.shape
+    if M_t.ndim == 4:
+        M2d = M_t.view(len(M_t), -1)
+    else:
+        M2d = M_t
+
+    update2d, V_t = msign_generalized_ht_v2_stream_qr(
+        M2d,
+        V_prev=V_prev,
+        p=power,
+        rank=rank,
+        eps=eps,
+    )
+
+    update2d *= max(1, M2d.size(-2) / M2d.size(-1)) ** 0.5
+    return update2d.view(original_shape), V_t
+
+
+class HTMuonWithAuxAdam_Stream(torch.optim.Optimizer):
+
+    def __init__(
+        self,
+        param_groups,
+        power=0.25,
+        rank=None,
+        qr_eps=1e-8,
+        nesterov=True,
+    ):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == {
+                    "params", "lr", "momentum", "weight_decay", "use_muon"
+                }
+            else:
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == {
+                    "params", "lr", "betas", "eps", "weight_decay", "use_muon"
+                }
+
+        super().__init__(param_groups, dict())
+        self.power = power
+        self.rank = rank
+        self.qr_eps = qr_eps
+        self.nesterov = nesterov
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        world_size = _get_world_size()
+        rank = _get_rank()
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                params = group["params"]
+                if len(params) == 0:
+                    continue
+
+                pad_n = (world_size - len(params) % world_size) % world_size
+                params_pad = params + [torch.empty_like(params[-1]) for _ in range(pad_n)]
+
+                for base_i in range(0, len(params_pad), world_size):
+                    local_i = base_i + rank
+                    if local_i < len(params):
+                        p = params[local_i]
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
+
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                            state["v_matrix"] = None
+
+                        update, new_v = muon_generalized_ht_update_v2_stream(
+                            grad=p.grad,
+                            momentum=state["momentum_buffer"],
+                            V_prev=state["v_matrix"],
+                            power=self.power,
+                            beta=group["momentum"],
+                            nesterov=self.nesterov,
+                            rank=self.rank,
+                            eps=self.qr_eps,
+                        )
+                        state["v_matrix"] = new_v
+
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update.reshape_as(p), alpha=-group["lr"])
+
+                    if _dist_is_ready():
+                        dist.all_gather(
+                            params_pad[base_i: base_i + world_size],
+                            params_pad[base_i + rank],
+                        )
+
+            else:
+                for p in group["params"]:
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p)
+
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+
+                    state["step"] += 1
+                    update = adam_update(
+                        p.grad,
+                        state["exp_avg"],
+                        state["exp_avg_sq"],
+                        state["step"],
+                        group["betas"],
+                        group["eps"],
+                    )
+
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+
+        return loss
+
+
+
+
+
+
+
+
 class HTMuonIntervalWithAuxAdam(torch.optim.Optimizer):
 
 
