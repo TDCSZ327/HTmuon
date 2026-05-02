@@ -56,7 +56,7 @@ torchrun --nproc_per_node=4 --master_port=20119 --master_addr=localhost torchrun
     --optimizer htmuon_stream \  #or acceleration use "htmuon_ns" / "htmuon_interval" (with interval=5)
     --seed 5 \
     --lr 0.001 \
-    --lrmuon 5e-3\
+    --lrmuon 0.03\
     --batch_size 128 \
     --total_batch_size 512 \
     --num_training_steps 20000 \
